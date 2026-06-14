@@ -21,25 +21,15 @@ import easyocr
 
 try:
     from paddleocr import PaddleOCR
-    PADDLE_AVAILABLE = True
 except Exception:
     PaddleOCR = None
-    PADDLE_AVAILABLE = False
-    print("PaddleOCR not available. Falling back to EasyOCR.")
+
+PADDLE_AVAILABLE = False
+USE_PADDLE = False
+USE_EASYOCR = True
+paddle_ocr = None
 
 reader = easyocr.Reader(['en'])
-if PADDLE_AVAILABLE:
-    paddle_ocr = PaddleOCR(
-        lang='en',  # other lang also available
-        use_angle_cls=False,
-        use_gpu=False,  # using cuda will conflict with pytorch in the same process
-        show_log=False,
-        max_batch_size=1024,
-        use_dilation=True,  # improves accuracy
-        det_db_score_mode='slow',  # improves accuracy
-        rec_batch_num=1024)
-else:
-    paddle_ocr = None
 import time
 import base64
 
@@ -557,7 +547,7 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
         image_source = image_source.convert('RGB')
     image_np = np.array(image_source)
     w, h = image_source.size
-    if use_paddleocr and PADDLE_AVAILABLE:
+    if USE_PADDLE and use_paddleocr and paddle_ocr is not None:
         if easyocr_args is None:
             text_threshold = 0.5
         else:
@@ -571,8 +561,6 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
             coord = []
             text = []
     else:
-        if use_paddleocr and not PADDLE_AVAILABLE:
-            print("PaddleOCR not available. Using EasyOCR fallback.")
         easyocr_result = run_easyocr(image_source, easyocr_args)
         coord = [item['bbox'] for item in easyocr_result]
         text = [item['text'] for item in easyocr_result]
