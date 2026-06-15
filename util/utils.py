@@ -108,23 +108,35 @@ def get_yolo_model(model_path):
 
 
 @torch.inference_mode()
-def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_model_processor, prompt=None, batch_size=128):
-    # Number of samples per batch, --> 128 roughly takes 4 GB of GPU memory for florence v2 model
+def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_model_processor, prompt=None, batch_size=1):
+    """
+    Generate captions for icon crops using the caption model/processor.
+
+    To avoid Florence-2 / Transformers attention-mask size mismatches when many
+    crops are sent in a single call, this function generates captions sequentially
+    (or in small micro-batches controlled by `batch_size`). It preserves the
+    original return structure (list of strings) and is resilient to individual
+    caption failures.
+    """
     to_pil = ToPILImage()
     if starting_idx:
         non_ocr_boxes = filtered_boxes[starting_idx:]
     else:
         non_ocr_boxes = filtered_boxes
+
     croped_pil_image = []
     for i, coord in enumerate(non_ocr_boxes):
         try:
             xmin, xmax = int(coord[0]*image_source.shape[1]), int(coord[2]*image_source.shape[1])
             ymin, ymax = int(coord[1]*image_source.shape[0]), int(coord[3]*image_source.shape[0])
             cropped_image = image_source[ymin:ymax, xmin:xmax, :]
+            # keep reasonable size for model input; resizing to small thumbnails
+            # is acceptable for icon captioning
             cropped_image = cv2.resize(cropped_image, (64, 64))
             croped_pil_image.append(to_pil(cropped_image))
-        except:
-            continue
+        except Exception:
+            # preserve ordering by appending a None placeholder
+            croped_pil_image.append(None)
 
     model, processor = caption_model_processor['model'], caption_model_processor['processor']
     if not prompt:
@@ -132,25 +144,54 @@ def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_
             prompt = "<CAPTION>"
         else:
             prompt = "The image shows"
-    
-    generated_texts = []
+
     device = model.device
+    generated_texts = []
+
+    # Ensure batch_size is small; do not allow a huge batch to be processed
+    if batch_size is None or batch_size < 1:
+        batch_size = 1
+
     for i in range(0, len(croped_pil_image), batch_size):
-        start = time.time()
         batch = croped_pil_image[i:i+batch_size]
-        t1 = time.time()
-        if model.device.type == 'cuda':
-            inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt", do_resize=False).to(device=device, dtype=torch.float16)
-        else:
-            inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt").to(device=device)
-        if 'florence' in model.config.name_or_path:
-            generated_ids = model.generate(input_ids=inputs["input_ids"],pixel_values=inputs["pixel_values"],max_new_tokens=20,num_beams=1, do_sample=False)
-        else:
-            generated_ids = model.generate(**inputs, max_length=100, num_beams=5, no_repeat_ngram_size=2, early_stopping=True, num_return_sequences=1) # temperature=0.01, do_sample=True,
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)
-        generated_text = [gen.strip() for gen in generated_text]
-        generated_texts.extend(generated_text)
-    
+
+        # Build per-crop captions sequentially inside the micro-batch to avoid
+        # sending many images in one call for Florence-2 which triggers the
+        # attention-mask size mismatch in Transformers.
+        for crop in batch:
+            if crop is None:
+                generated_texts.append("")
+                continue
+
+            try:
+                # prepare inputs for single (or few) images
+                if model.device.type == 'cuda':
+                    inputs = processor(images=[crop], text=[prompt], return_tensors="pt", do_resize=False).to(device=device, dtype=torch.float16)
+                else:
+                    inputs = processor(images=[crop], text=[prompt], return_tensors="pt").to(device=device)
+
+                # Florence-2 expects explicit input_ids and pixel_values in some builds
+                if 'florence' in model.config.name_or_path:
+                    try:
+                        ids = model.generate(input_ids=inputs.get("input_ids"), pixel_values=inputs.get("pixel_values"), max_new_tokens=20, num_beams=1, do_sample=False)
+                    except Exception as e:
+                        # Fall back to calling with full kwargs if above fails
+                        ids = model.generate(**{k: v for k, v in inputs.items() if v is not None}, max_new_tokens=20, num_beams=1, do_sample=False)
+                else:
+                    ids = model.generate(**inputs, max_length=100, num_beams=5, no_repeat_ngram_size=2, early_stopping=True, num_return_sequences=1)
+
+                # decode result safely
+                try:
+                    caption = processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
+                except Exception:
+                    # some processors expect different decode signature
+                    caption = processor.decode(ids[0], skip_special_tokens=True).strip() if hasattr(processor, 'decode') else ""
+
+                generated_texts.append(caption)
+            except Exception as e:
+                print("Florence caption failed:", e)
+                generated_texts.append("")
+
     return generated_texts
 
 
