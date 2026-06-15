@@ -27,6 +27,10 @@ def _center(box: List[float]) -> (float, float):
     return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
 
 
+def _distance(center1: (float, float), center2: (float, float)) -> float:
+    return ((center1[0] - center2[0]) ** 2 + (center1[1] - center2[1]) ** 2) ** 0.5
+
+
 def _adjacent(box1: List[float], box2: List[float], tolerance: float = 0.04) -> bool:
     if _iou(box1, box2) > 0.0:
         return False
@@ -37,15 +41,22 @@ def _adjacent(box1: List[float], box2: List[float], tolerance: float = 0.04) -> 
     return False
 
 
-def build_scene_graph(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_scene_graph(
+    elements: List[Dict[str, Any]], top_k: int = 5, distance_threshold: float = 0.25
+) -> List[Dict[str, Any]]:
     relations = []
     seen = set()
+    centers = [_center(element.get("bbox", [0.0, 0.0, 0.0, 0.0])) for element in elements]
 
     for i, source in enumerate(elements):
+        source_id = source.get("id", i)
+        source_box = source.get("bbox", [0.0, 0.0, 0.0, 0.0])
+
+        # Keep global inside/overlaps relations across all pairs.
         for j, target in enumerate(elements):
-            if i == j:
+            target_id = target.get("id", j)
+            if i == j or source_id == target_id:
                 continue
-            source_box = source.get("bbox", [0.0, 0.0, 0.0, 0.0])
             target_box = target.get("bbox", [0.0, 0.0, 0.0, 0.0])
             if _is_inside(source_box, target_box) and source_box != target_box:
                 relation = (i, "inside", j)
@@ -58,6 +69,25 @@ def build_scene_graph(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 if relation not in seen:
                     seen.add(relation)
                     relations.append({"source": i, "relation": "overlaps", "target": j})
+                continue
+
+        # Use a sparse neighborhood for spatial relations.
+        neighbors = []
+        for j, target in enumerate(elements):
+            target_id = target.get("id", j)
+            if i == j or source_id == target_id:
+                continue
+            dist = _distance(centers[i], centers[j])
+            neighbors.append((dist, j))
+
+        neighbors.sort(key=lambda item: item[0])
+        for dist, j in neighbors[:top_k]:
+            if dist > distance_threshold:
+                break
+            target_box = elements[j].get("bbox", [0.0, 0.0, 0.0, 0.0])
+            if _is_inside(source_box, target_box) and source_box != target_box:
+                continue
+            if _intersection(source_box, target_box) > 0 and _iou(source_box, target_box) > 0.05:
                 continue
             if source_box[3] <= target_box[1]:
                 relation = (i, "above", j)
